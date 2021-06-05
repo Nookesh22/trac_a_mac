@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+
+
+import time
+from datetime import datetime
+import sqlite3
+from easysnmp import Session
+from sqlite3 import Error
+
+default_vlan = 'DEFAULT_VLAN'
+oids = {'dot1dTpFdbEntryAddress': '1.3.6.1.2.1.17.4.3.1.1',
+            'dot1dTpFdbEntryPort': '1.3.6.1.2.1.17.4.3.1.2',
+            'dot1qTpFdbEntryStatus': '1.3.6.1.2.1.17.4.3.1.3',
+            'dot1qTpFdbAddress': '1.3.6.1.2.17.7.1.2.2.1.1',
+            'dot1qTpFdbPort': '1.3.6.1.2.1.17.7.1.2.2.1.2',
+            'dot1qTpFdbStatus': '1.3.6.1.2.1.17.7.1.2.2.1.3',
+            'dot1qVlanStaticName': '1.3.6.1.2.1.17.7.1.4.3.1.1',
+            'sysDescr': '1.1.3.6.1.2.1.1.1',
+            'dot1dBasePortIfIndex': '1.3.6.1.2.1.17.1.4.1.2',
+            'vlans': '1.3.6.1.2.1.17.7.1.4.3.1.4'
+        }
+
+
+def database_connection(db_file):
+    
+    connection = None
+    try:
+        connection = sqlite3.connect(db_file)
+    except Error as e:
+        print(e)
+    finally:
+        if connection:
+            devices = connection.execute('Select * from devices')
+            for elements in devices:
+                ip = elements[0]
+                port = int(elements[1])
+                community = elements[2]
+                version = int(elements[3])
+               # print("start the probe")
+                probe_the_switch(ip, port, community, version, connection)
+
+
+            connection.close()
+
+
+def probe_the_switch(ip, port, community, version, connection):
+    
+    try:
+        session = Session(hostname=ip, remote_port=port, version=version, community=community)
+    except Exception as e:
+        print(e)
+        failed = connection.execute("select failed from devices where ip=?, port=?", (ip, port))
+        failed += 1
+        connection.execute("update devices set failed=? where (ip=? and port=?)", (failed, ip, port))
+        connection.commit()
+    begin = str(datetime.fromtimestamp(int(time.time())))
+    #print(begin)
+    try:
+        macs = session.walk(oids['dot1dTpFdbEntryAddress'])
+        ports = session.walk(oids['dot1dTpFdbEntryPort'])
+        for m, p in zip(macs, ports):
+            oid = m.oid;
+            oid_index = m.oid_index;
+            snmp_type = m.snmp_type
+            mac = ':'.join('{:02x}'.format(ord(a)) for a in m.value)
+            portval = p.value
+           # print(ip,mac,portval)
+            devices = connection.execute("SELECT * from ListOfMacs where (port=? and device=?)", (portval, ip))
+            fetch_device_data = devices.fetchall()
+            for connected_macs in fetch_device_data:
+                m = connected_macs[3]
+            if len(fetch_device_data) == 0:
+             #   print(ip,mac,portval)
+                connection.execute('''INSERT INTO ListOfMacs(device, vlans, port, macs) values (?,?,?,?)''', (ip, default_vlan, portval, mac))
+                connection.commit()
+            elif len(fetch_device_data) == 1 and m.find(mac) == -1:
+                finalmac = m + "," + mac
+            #    print(finalmac)
+                connection.execute("UPDATE ListOfMacs set macs=? where port=?", (finalmac, portval))
+                connection.commit()
+        vlansnum = []
+        vlanname = []
+        vlans = session.walk(oids['vlans'])
+        vlanindex = session.walk(oids['dot1qVlanStaticName'])
+        values = []
+        vlan_oids = []
+        for index, vlan in zip(vlanindex, vlans):
+            value = ':'.join('{:02x}'.format(ord(x)) for x in vlan.value)
+            values = value.split(':')
+            oid = vlan.oid
+            vlan_oids.append(oid)
+            vname = index.value
+            vnums = oid.split('.')
+            vnum = str(vnums[-1])
+            combine = ''
+            if vname != default_vlan:
+                for i in range(len(values)):
+                    hexlist = values
+                    mac_hex = hexlist[i]
+                    scale = 16
+                    no_of_bits = 8
+                    orghex = bin(int(mac_hex, scale))[2:].zfill(no_of_bits)
+                    combine = combine + str(orghex)
+                    orghex = ''
+                    listvls = list(combine)
+                for i in range(len(listvls)):
+                    num = i + 1
+                    vlanname.append(str(vname))
+                    vlansnum.append(num)
+                #    print(vname)
+        for i in range(len(vlansnum)):
+            portlan = '1'
+            connection.execute("update ListOfMacs set vlans = ? where port=?", (vlanname[i], vlansnum[i]))
+            time.sleep(0.005)
+            connection.commit()
+            
+    except Exception as e:
+        print(str(e) + ' ' + str(ip) + ":" + str(port))
+    end = str(datetime.fromtimestamp(int(time.time())))
+    #print(end)
+   # print('OK')
+    connection.execute("update devices set first_probe=?, last_probe=? where (ip=? and port=?)",
+                 (begin, end, ip, port))
+    connection.commit()
+#    print("successfully probed the device:" + ip + ":" + port)
+
+if __name__ == '__main__':
+    while True:
+        print("running the track-a-mac software")
+        
+        database_connection('nplab.db')
+        time.sleep(60)
